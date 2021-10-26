@@ -32,6 +32,8 @@ from pytorch_lightning.callbacks.progress import ProgressBar
 from tqdm import tqdm
 import sys
 
+from math import ceil, floor
+
 def distance_matrix(x:torch.Tensor, y:torch.Tensor=None, p=2)->torch.Tensor:  # pairwise distance of vectors
 
     y = x if type(y) == type(None) else y
@@ -114,6 +116,8 @@ class KNN(NN):
 
         knn = dist.topk(self.k, largest=False)
 
+        del dist
+        torch.cuda.empty_cache()
 
         return knn
 
@@ -428,15 +432,13 @@ class STPM(pl.LightningModule):
         self.init_results_list()
 
         self.data_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size), Image.ANTIALIAS),
+                        transforms.Resize((args.load_size*args.N, args.load_size*args.M), Image.ANTIALIAS),
                         transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size),
                         transforms.Normalize(mean=mean_train,
                                             std=std_train)])
         self.gt_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size)),
-                        transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size)])
+                        transforms.Resize((args.load_size*args.N, args.load_size*args.M)),
+                        transforms.ToTensor()])
 
         self.inv_normalize = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255])
 
@@ -490,7 +492,7 @@ class STPM(pl.LightningModule):
             data_path_root=args.dataset_path, gt_path_root=args.gt_path,
             transform=self.data_transforms, gt_transform=self.gt_transforms,
             phase='test', M=args.M, N=args.N, recursive=args.recursive_search)
-        test_loader = DataLoader(test_datasets, batch_size=args.batch_size, shuffle=False, num_workers=0) #, pin_memory=True) # only work on batch_size=1, now.
+        test_loader = DataLoader(test_datasets, batch_size=1, shuffle=False, num_workers=0) #, pin_memory=True) # only work on batch_size=1, now.
         self.img_fullpath_list = test_datasets.img_paths
         return test_loader
 
@@ -614,7 +616,41 @@ class STPM(pl.LightningModule):
         with open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'wb') as f:
             pickle.dump(self.embedding_coreset, f)
 
-    def test_step(self, batch, batch_idx): # Nearest Neighbour Search
+    def test_step( self, batch, batch_idx ):
+        x, gt, label, filename = batch
+        self.initialize_buffer(next_filename=filename[0], next_label=label[0])
+
+        imgs, rois = self.divide_image_by_grid_m_n( x, args.M, args.N )
+
+        B = args.batch_size
+        for i in range(0, len(imgs), B):
+            small_batch = B if (i + B) < len(imgs) else len(imgs) - i
+            b_imgs = torch.stack(imgs[i:i+small_batch], dim=0)
+            b_rois = rois[i:i+small_batch]
+
+            # extract embedding
+            features = self(b_imgs)
+
+            embeddings = []
+            for feature in features:
+                m = torch.nn.AvgPool2d(3, 1, 1)
+                embeddings.append( m(feature) )
+            embedding = embedding_concat( embeddings[0], embeddings[1] )
+            _, D, H, W = embedding.shape
+
+            # embedding_test = np.array( reshape_embedding(embedding.cpu().detach().numpy()) )
+            embedding_test = embedding.cpu().detach().numpy().transpose(0,2,3,1).reshape((-1,D))
+
+            K = self.knn.k
+            score_patches = self.knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy().reshape((B,-1,K))
+
+            self.exmaps.extend( list(score_patches[:,:,0].reshape(B,H,W)) )
+            self.rois.extend( b_rois )
+
+        self.end_of_one_image()
+
+
+    def test_step_old(self, batch, batch_idx): # Nearest Neighbour Search
         x_, gt_, label_, file_name_, roi_ = batch
         roi_ = [ list(i.cpu().detach().numpy()) for i in roi_ ]
         roi_ = np.asarray( roi_ ).transpose()
@@ -761,6 +797,30 @@ class STPM(pl.LightningModule):
         self.save_anomaly_map(anomaly_map_resized_blur, input_img,
                               np.zeros_like(input_img), self.prev_filename,
                               args.category)
+
+    def divide_image_by_grid_m_n(self, input_img:torch.Tensor, m:int, n:int) \
+        -> tuple[ list[torch.Tensor], list[tuple[int,int,int,int]]]:
+        """Image will be divide by m and n."""
+        input_img = input_img.squeeze(dim=0)
+        _, H, W = input_img.shape
+
+        step_x = W / m
+        step_y = H / n
+
+        rois = []
+        imgs = []
+        for r in range(n):
+            for c in range(m):
+                left = floor(c*step_x)
+                right = ceil((c+1)*step_x)
+                top = floor(r*step_y)
+                bottom = ceil((r+1)*step_y)
+                roi = (left, top, right, bottom)
+                crop = input_img[:,top:bottom, left:right]
+                rois.append(roi)
+                imgs.append(crop)
+
+        return imgs, rois
 
 
     def initialize_buffer(self, next_filename="", next_label=0):
