@@ -130,3 +130,10 @@ dmypy.json
 
 # embedding.pickle
 ./embeddings/
+./embeddings/*
+embeddings/
+embeddings/90deg/embedding.pickle
+embeddings/bottle/embedding.pickle
+embeddings/carpet/embedding.pickle
+embeddings/glotec/embedding.pickle
+.vscode/launch.json
