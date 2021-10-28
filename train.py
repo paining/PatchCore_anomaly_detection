@@ -25,6 +25,7 @@ from scipy.ndimage import gaussian_filter
 from torchvision.transforms.functional import InterpolationMode
 
 from PatchCoreDataset import PatchCoreDataset
+from feature_extractor import feature_extractor
 
 from time import time
 
@@ -195,6 +196,9 @@ def prep_dirs(root):
 
 def embedding_concat(x, y):
     # from https://github.com/xiahaifeng1995/PaDiM-Anomaly-Detection-Localization-master
+    if x.nelement() == 0:
+        return y
+
     B, C1, H1, W1 = x.size()
     _, C2, H2, W2 = y.size()
     s = int(H1 / H2)
@@ -392,7 +396,13 @@ def concatenate_with_rois( data, rois ):
      - `rois` : roi table. (list or ndarray)
 
     Return :
-     - `merged data` : merged data."""
+    --------
+     - `merged data` : merged data.
+    
+    To do :
+    -------
+     - complete function.
+    """
     if isinstance(rois, list):
         rois = np.asarray( rois )
     if isinstance(data, list):
@@ -427,6 +437,10 @@ class STPM(pl.LightningModule):
         self.model.layer2[-1].register_forward_hook(hook_t)
         self.model.layer3[-1].register_forward_hook(hook_t)
 
+        self.fe = feature_extractor("wide_resnet50_2", ["layer2", "layer3"] )
+        self.fe.to(torch.device("cuda"))
+        self.fe.eval()
+
         self.criterion = torch.nn.MSELoss(reduction='sum')
 
         self.init_results_list()
@@ -454,8 +468,15 @@ class STPM(pl.LightningModule):
 
     def forward(self, x_t):
         self.init_features()
+        features = self.fe( x_t )
+
+        return features
+
+    def forward_old(self, x_t):
+        self.init_features()
         _ = self.model(x_t)
         return self.features
+
 
     def save_anomaly_map(self, anomaly_map, input_img, gt_img, file_name, x_type):
         if anomaly_map.shape[0] != input_img.shape[0] and \
@@ -620,32 +641,59 @@ class STPM(pl.LightningModule):
         x, gt, label, filename = batch
         self.initialize_buffer(next_filename=filename[0], next_label=label[0])
 
-        imgs, rois = self.divide_image_by_grid_m_n( x, args.M, args.N )
+        full_features = self( x )
+        _, C, H, W = full_features[0].shape
+        embedding = torch.zeros((0,C,H,W), device=self.device)
+        
+        for feature in full_features:
+            m = torch.nn.AvgPool2d(3, 1, 1)
+            embedding = embedding_concat( embedding, m(feature) )
 
-        B = args.batch_size
-        for i in range(0, len(imgs), B):
-            small_batch = B if (i + B) < len(imgs) else len(imgs) - i
-            b_imgs = torch.stack(imgs[i:i+small_batch], dim=0)
-            b_rois = rois[i:i+small_batch]
+        _, D, H, W = embedding.shape
+        embedding = embedding.permute(0,2,3,1).reshape(-1,D)
 
-            # extract embedding
-            features = self(b_imgs)
+        pos = list(np.linspace( 0, embedding.shape[0], args.batch_size, dtype=np.uint ))
+        K = self.knn.k
+        scores = torch.zeros( (embedding.shape[0], K), device=embedding.device)
+        for start, end in zip(pos, pos[1:]):
+            scores[start:end,:] = self.knn(embedding[start:end,:])[0]
 
-            embeddings = []
-            for feature in features:
-                m = torch.nn.AvgPool2d(3, 1, 1)
-                embeddings.append( m(feature) )
-            embedding = embedding_concat( embeddings[0], embeddings[1] )
-            _, D, H, W = embedding.shape
+        self.scores = scores.reshape(H,W,K).cpu().detach().numpy()
 
-            # embedding_test = np.array( reshape_embedding(embedding.cpu().detach().numpy()) )
-            embedding_test = embedding.cpu().detach().numpy().transpose(0,2,3,1).reshape((-1,D))
+        # imgs, rois = self.divide_image_by_grid_m_n( x, args.M, args.N )
 
-            K = self.knn.k
-            score_patches = self.knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy().reshape((B,-1,K))
+        # B = args.batch_size
+        # for i in range(0, len(imgs), B):
+        #     small_batch = B if (i + B) < len(imgs) else len(imgs) - i
+        #     b_imgs = torch.stack(imgs[i:i+small_batch], dim=0)
+        #     b_rois = rois[i:i+small_batch]
 
-            self.exmaps.extend( list(score_patches[:,:,0].reshape(B,H,W)) )
-            self.rois.extend( b_rois )
+        #     # extract embedding
+        #     features = self(b_imgs)
+
+        #     embedding = torch.zeros(
+        #         (0,features[0].shape[1],features[0].shape[2],features[0].shape[3]),
+        #         device=self.device)
+            
+        #     for feature in features:
+        #         m = torch.nn.AvgPool2d(3, 1, 1)
+        #         embedding = embedding_concat( embedding, m(feature) )
+        #     # embeddings = []
+        #     # for feature in features:
+        #     #     m = torch.nn.AvgPool2d(3, 1, 1)
+        #     #     embeddings.append( m(feature) )
+        #     # embedding = embedding_concat( embeddings[0], embeddings[1] )
+            
+        #     _, D, H, W = embedding.shape
+
+        #     # embedding_test = np.array( reshape_embedding(embedding.cpu().detach().numpy()) )
+        #     embedding_test = embedding.cpu().detach().numpy().transpose(0,2,3,1).reshape((-1,D))
+
+        #     K = self.knn.k
+        #     score_patches = self.knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy().reshape((B,-1,K))
+
+        #     self.exmaps.extend( list(score_patches[:,:,0].reshape(B,H,W)) )
+        #     self.rois.extend( b_rois )
 
         self.end_of_one_image()
 
@@ -743,11 +791,12 @@ class STPM(pl.LightningModule):
     def end_of_one_image(self):
         """When we use grid detection, we need merging process when one image
         end."""
-        start = time()
-        anomaly_map_resized = merge_with_rois( self.exmaps, self.rois )
-        # input_img = merge_with_rois( self.inputs, self.rois )
-        duration = (time() - start) * 1000
-        self.times["merge"].append( duration )
+        # start = time()
+        # anomaly_map_resized = merge_with_rois( self.exmaps, self.rois )
+        # # input_img = merge_with_rois( self.inputs, self.rois )
+        # duration = (time() - start) * 1000
+        # self.times["merge"].append( duration )
+        anomaly_map_resized = cv2.resize( self.scores[:,:,0], (args.M*args.input_size, args.N*args.input_size) )
 
         # save result.
         # gt_np = gt.cpu().numpy()[0].astype(int)
@@ -783,10 +832,9 @@ class STPM(pl.LightningModule):
         # elif len( filename_match_list ) > 1:
         #     print( "too many matched name! : ", len(filename_match_list) )
         #     print( filename_match_list )
-        input_img = np.asarray( Image.open( filename_match_list[0] ) )
-        input_img = cv2.resize( input_img, (args.input_size*args.M,
-                                            args.input_size*args.N) )
-
+        input_img = Image.open( filename_match_list[0] ).convert("RGB")
+        shape = anomaly_map_resized_blur.shape
+        input_img = cv2.resize( np.asarray(input_img), (shape[-1], shape[-2]) )
         
         # self.gt_list_px_lvl.extend(gt_np.ravel())
         # self.pred_list_px_lvl.extend(anomaly_map_resized_blur.ravel())
