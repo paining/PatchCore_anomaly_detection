@@ -113,12 +113,13 @@ class KNN(NN):
 
 
         # dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-        dist = distance_matrix(x, self.train_pts, self.p)
+        self.dist = distance_matrix(x, self.train_pts, self.p)
 
-        knn = dist.topk(self.k, largest=False)
+        # knn = self.dist.topk(self.k, largest=False)
+        knn = self.dist.max(dim=1)
 
-        del dist
-        torch.cuda.empty_cache()
+        # del dist
+        # torch.cuda.empty_cache()
 
         return knn
 
@@ -503,7 +504,7 @@ class STPM(pl.LightningModule):
             data_path_root=args.dataset_path, gt_path_root=args.gt_path,
             transform=self.data_transforms, gt_transform=self.gt_transforms,
             phase='train', M=args.M, N=args.N)
-        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True, num_workers=0) #, pin_memory=True)
+        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=False, num_workers=0) #, pin_memory=True)
         return train_loader
 
     def test_dataloader(self):
@@ -548,16 +549,35 @@ class STPM(pl.LightningModule):
         self.initialize_buffer()
         
     def training_step(self, batch, batch_idx): # save locally aware patch features
-        x, _, _, file_name, rois = batch
+        x, _, _, file_name = batch
+
         features = self(x)
-        embeddings = []
+        _, C, H, W = features[0].shape
+        embedding = torch.zeros((0,C,H,W), device=self.device)
+        
         for feature in features:
             m = torch.nn.AvgPool2d(3, 1, 1)
-            embeddings.append(m(feature))
-        embedding = embedding_concat(embeddings[0], embeddings[1])
-        # embedding = embedding_concat(embeddings[1], embeddings[2])
-        # embedding = embedding_concat(embeddings[0], embedding)
-        self.embedding_list.extend(reshape_embedding(np.array(embedding.cpu().detach())))
+            embedding = embedding_concat( embedding, m(feature) )
+
+        # embedding = embedding[:,:,15:-15,15:-15]
+
+        _, D, H, W = embedding.shape
+        embedding = embedding.permute(0,2,3,1).reshape(-1,D)
+
+        embed_list = list(embedding.cpu().detach().numpy())
+        self.embedding_list.extend(embed_list)
+
+        # self.embedding_list.extend(reshape_embedding(np.array(embedding.cpu().detach())))
+
+        # features = self(x)
+        # embeddings = []
+        # for feature in features:
+        #     m = torch.nn.AvgPool2d(3, 1, 1)
+        #     embeddings.append(m(feature))
+        # embedding = embedding_concat(embeddings[0], embeddings[1])
+        # # embedding = embedding_concat(embeddings[1], embeddings[2])
+        # # embedding = embedding_concat(embeddings[0], embedding)
+        # self.embedding_list.extend(reshape_embedding(np.array(embedding.cpu().detach())))
         
         # Save roi and filename list.
         # Roi and filename list will use for display selected coreset samples.
@@ -641,24 +661,46 @@ class STPM(pl.LightningModule):
         x, gt, label, filename = batch
         self.initialize_buffer(next_filename=filename[0], next_label=label[0])
 
+        torch.cuda.synchronize()
+        t_prev = time()
         full_features = self( x )
+        torch.cuda.synchronize()
+        self.times["cnn"].append( (time()-t_prev)*1000 )
+        
+        torch.cuda.synchronize()
+        t_prev = time()
         _, C, H, W = full_features[0].shape
         embedding = torch.zeros((0,C,H,W), device=self.device)
         
         for feature in full_features:
             m = torch.nn.AvgPool2d(3, 1, 1)
             embedding = embedding_concat( embedding, m(feature) )
+        torch.cuda.synchronize()
+        self.times["embedding"].append( (time()-t_prev)*1000 )
 
         _, D, H, W = embedding.shape
         embedding = embedding.permute(0,2,3,1).reshape(-1,D)
 
-        pos = list(np.linspace( 0, embedding.shape[0], args.batch_size, dtype=np.uint ))
+        torch.cuda.synchronize()
+        t_prev = time()
         K = self.knn.k
-        scores = torch.zeros( (embedding.shape[0], K), device=embedding.device)
-        for start, end in zip(pos, pos[1:]):
-            scores[start:end,:] = self.knn(embedding[start:end,:])[0]
 
-        self.scores = scores.reshape(H,W,K).cpu().detach().numpy()
+        score_list = [
+            self.knn(mini_batch)[0]
+                for mini_batch in embedding.tensor_split( args.batch_size, dim=0 )
+        ]
+        scores = torch.cat( score_list, dim=0 )
+
+        # pos = list(np.linspace( 0, embedding.shape[0], args.batch_size, dtype=np.uint ))
+        # scores = torch.zeros( (embedding.shape[0], K), device=embedding.device)
+        # for start, end in zip(pos, pos[1:]):
+        #     scores[start:end,:] = self.knn(embedding[start:end,:])[0]
+        torch.cuda.synchronize()
+        self.times["knn"].append( (time()-t_prev)*1000 )
+
+        t_prev = time()
+        self.scores = scores.reshape(H,W).cpu().detach().numpy()
+        self.times["score"].append( (time()-t_prev)*1000 )
 
         # imgs, rois = self.divide_image_by_grid_m_n( x, args.M, args.N )
 
@@ -796,7 +838,7 @@ class STPM(pl.LightningModule):
         # # input_img = merge_with_rois( self.inputs, self.rois )
         # duration = (time() - start) * 1000
         # self.times["merge"].append( duration )
-        anomaly_map_resized = cv2.resize( self.scores[:,:,0], (args.M*args.input_size, args.N*args.input_size) )
+        anomaly_map_resized = cv2.resize( self.scores[:,:], (args.M*args.input_size, args.N*args.input_size) )
 
         # save result.
         # gt_np = gt.cpu().numpy()[0].astype(int)
@@ -809,21 +851,25 @@ class STPM(pl.LightningModule):
         # record times. (unit:micro seconds)
         duration = (time() - self.prev_time) * 1000
         self.times["detection"].append( duration )
-        mean_time = sum(self.tmp_cnn_times) #/ \
-        #    (args.batch_size*len(self.tmp_cnn_times))
-        self.times["cnn"].append( mean_time )
-        mean_time = sum(self.tmp_embed_times) #/ \
-        #    (args.batch_size*len(self.tmp_embed_times))
-        self.times["embedding"].append( mean_time )
-        mean_time = sum(self.tmp_knn_times) #/ \
-        #    (args.batch_size*len(self.tmp_knn_times))
-        self.times["knn"].append( mean_time )
-        mean_time = sum(self.tmp_reshape_times) #/ \
-        #    (args.batch_size*len(self.tmp_reshape_times))
-        self.times["reshape"].append( mean_time )
-        mean_time = sum(self.tmp_score_times) #/ \
-        #    (args.batch_size*len(self.tmp_score_times))
-        self.times["score"].append( mean_time )
+        # mean_time = sum(self.tmp_cnn_times) #/ \
+        # #    (args.batch_size*len(self.tmp_cnn_times))
+        # self.times["cnn"].append( mean_time )
+        # mean_time = sum(self.tmp_embed_times) #/ \
+        # #    (args.batch_size*len(self.tmp_embed_times))
+        # self.times["embedding"].append( mean_time )
+        # mean_time = sum(self.tmp_knn_times) #/ \
+        # #    (args.batch_size*len(self.tmp_knn_times))
+        # self.times["knn"].append( mean_time )
+        # mean_time = sum(self.tmp_reshape_times) #/ \
+        # #    (args.batch_size*len(self.tmp_reshape_times))
+        # self.times["reshape"].append( mean_time )
+        # mean_time = sum(self.tmp_score_times) #/ \
+        # #    (args.batch_size*len(self.tmp_score_times))
+        # self.times["score"].append( mean_time )
+
+        save_result = True
+        if save_result == False:
+            return
 
         filename_match_list = [ fullpath for fullpath in self.img_fullpath_list
                                             if self.prev_filename in fullpath ]
@@ -896,7 +942,8 @@ class STPM(pl.LightningModule):
 
         # print computation times
         for key, value in self.times.items():
-            print( f"{key} times(average) : {sum( value ) / len( value )}")
+            if len( value ) != 0:
+                print( f"{key} times(average) : {sum( value ) / len( value )}")
 
         return
 
