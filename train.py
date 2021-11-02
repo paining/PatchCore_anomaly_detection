@@ -113,10 +113,10 @@ class KNN(NN):
 
 
         # dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-        self.dist = distance_matrix(x, self.train_pts, self.p)
+        dist = distance_matrix(x, self.train_pts, self.p)
 
         # knn = self.dist.topk(self.k, largest=False)
-        knn = self.dist.max(dim=1)
+        knn = dist.topk(self.k, largest=False)
 
         # del dist
         # torch.cuda.empty_cache()
@@ -483,6 +483,8 @@ class STPM(pl.LightningModule):
         if anomaly_map.shape[0] != input_img.shape[0] and \
            anomaly_map.shape[1] != input_img.shape[1]:
             anomaly_map = cv2.resize(anomaly_map, (input_img.shape[0], input_img.shape[1]))
+        with open(os.path.join(self.sample_path,"anomaly_min_max.csv"),"a") as f:
+            f.write(f"{file_name},{anomaly_map.min()},{anomaly_map.max()}\n")
         anomaly_map_norm = min_max_norm(anomaly_map)
         anomaly_map_norm_hm = cvt2heatmap(anomaly_map_norm*255)
 
@@ -560,6 +562,7 @@ class STPM(pl.LightningModule):
             embedding = embedding_concat( embedding, m(feature) )
 
         # embedding = embedding[:,:,15:-15,15:-15]
+        embedding = embedding[:,:,2:-2:2,2:-2:2]
 
         _, D, H, W = embedding.shape
         embedding = embedding.permute(0,2,3,1).reshape(-1,D)
@@ -681,25 +684,27 @@ class STPM(pl.LightningModule):
         _, D, H, W = embedding.shape
         embedding = embedding.permute(0,2,3,1).reshape(-1,D)
 
+
         torch.cuda.synchronize()
         t_prev = time()
         K = self.knn.k
 
-        score_list = [
-            self.knn(mini_batch)[0]
-                for mini_batch in embedding.tensor_split( args.batch_size, dim=0 )
-        ]
-        scores = torch.cat( score_list, dim=0 )
+        # score_list = [
+        #     self.knn(mini_batch)[0]
+        #         for mini_batch in embedding.tensor_split( args.batch_size, dim=0 )
+        # ]
+        # scores = torch.cat( score_list, dim=0 )
 
-        # pos = list(np.linspace( 0, embedding.shape[0], args.batch_size, dtype=np.uint ))
-        # scores = torch.zeros( (embedding.shape[0], K), device=embedding.device)
-        # for start, end in zip(pos, pos[1:]):
-        #     scores[start:end,:] = self.knn(embedding[start:end,:])[0]
+        pos = list(np.linspace( 0, embedding.shape[0], args.batch_size, dtype=np.uint ))
+        scores = torch.zeros( (embedding.shape[0], K), device=embedding.device)
+        for start, end in zip(pos, pos[1:]):
+            scores[start:end,:] = self.knn(embedding[start:end,:])[0]
+
         torch.cuda.synchronize()
         self.times["knn"].append( (time()-t_prev)*1000 )
 
         t_prev = time()
-        self.scores = scores.reshape(H,W).cpu().detach().numpy()
+        self.scores = scores.reshape(H,W,K).cpu().detach().numpy()
         self.times["score"].append( (time()-t_prev)*1000 )
 
         # imgs, rois = self.divide_image_by_grid_m_n( x, args.M, args.N )
@@ -838,7 +843,7 @@ class STPM(pl.LightningModule):
         # # input_img = merge_with_rois( self.inputs, self.rois )
         # duration = (time() - start) * 1000
         # self.times["merge"].append( duration )
-        anomaly_map_resized = cv2.resize( self.scores[:,:], (args.M*args.input_size, args.N*args.input_size) )
+        anomaly_map_resized = cv2.resize( self.scores[:,:,0], (args.M*args.input_size, args.N*args.input_size) )
 
         # save result.
         # gt_np = gt.cpu().numpy()[0].astype(int)
