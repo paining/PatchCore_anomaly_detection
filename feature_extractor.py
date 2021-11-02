@@ -35,6 +35,10 @@ class feature_extractor(torch.nn.Module):
         
         self.fe = torch.nn.Sequential(dict)
 
+        base_dict = base_model.state_dict()
+        base_dict = {k: v for k, v in base_dict.items() if k in self.fe.state_dict()}
+        self.fe.load_state_dict(base_dict)
+
         self.initialize_features()
         def hook_t(module, input, output):
             self.features.append(output)
